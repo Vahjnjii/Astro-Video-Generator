@@ -7,106 +7,179 @@
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:sans-serif;background:#0f0f0f;color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-  .card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:16px;padding:36px;width:100%;max-width:480px}
+  .card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:16px;padding:36px;width:100%;max-width:500px}
   h2{font-size:22px;margin-bottom:6px;text-align:center}
   .sub{color:#666;font-size:13px;text-align:center;margin-bottom:28px}
   .btn{display:block;width:100%;padding:14px;background:#0066ff;color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;transition:background .2s;text-align:center}
   .btn:hover:not(:disabled){background:#0052cc}
   .btn:disabled{opacity:.4;cursor:not-allowed}
   #status{display:none;margin-top:20px}
-  .bar-wrap{background:#222;border-radius:6px;height:6px;margin:10px 0 6px}
-  .bar{background:#0066ff;height:6px;border-radius:6px;width:0%;transition:width .6s}
-  .msg{font-size:13px;color:#888}
-  #result{display:none;margin-top:20px;text-align:center}
-  #result .label{font-size:13px;color:#4caf50;margin-bottom:10px}
-  video{width:100%;border-radius:10px;background:#000}
-  .dl{display:inline-block;margin-top:12px;padding:10px 24px;background:#1a7f37;color:#fff;border-radius:8px;text-decoration:none;font-size:14px;font-weight:600}
+  .bar-wrap{background:#222;border-radius:6px;height:8px;margin:10px 0 6px}
+  .bar{background:linear-gradient(90deg,#0066ff,#00aaff);height:8px;border-radius:6px;width:0%;transition:width .8s ease}
+  .msg{font-size:13px;color:#888;text-align:center;margin-top:6px}
+  .timer{font-size:12px;color:#555;text-align:center;margin-top:4px}
+  #result{display:none;margin-top:24px}
+  .ready-label{font-size:14px;color:#4caf50;text-align:center;margin-bottom:12px;font-weight:600}
+  video{width:100%;border-radius:12px;background:#000;max-height:280px}
+  .actions{display:flex;gap:10px;margin-top:12px}
+  .dl{flex:1;padding:11px;background:#1a7f37;color:#fff;border-radius:8px;text-decoration:none;font-size:14px;font-weight:600;text-align:center;display:block}
   .dl:hover{background:#156d2e}
-  .new{display:inline-block;margin-top:8px;margin-left:10px;padding:10px 24px;background:#333;color:#fff;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;border:none}
-  .new:hover{background:#444}
+  .newbtn{flex:1;padding:11px;background:#333;color:#fff;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;border:none}
+  .newbtn:hover{background:#444}
   .dot{animation:blink 1.2s infinite;display:inline-block}
   .dot:nth-child(2){animation-delay:.2s}
   .dot:nth-child(3){animation-delay:.4s}
   @keyframes blink{0%,80%,100%{opacity:0}40%{opacity:1}}
+  .error{color:#ff4444;font-size:13px;text-align:center;margin-top:12px;display:none}
 </style>
 </head>
 <body>
 <div class="card">
   <h2>Astro Video Generator</h2>
-  <p class="sub">Generates a unique random 20s video every time</p>
+  <p class="sub">Generates a unique random 20s astrology video every time</p>
 
   <button class="btn" id="btn" onclick="generate()">Generate Video</button>
 
   <div id="status">
-    <div class="msg" id="msg">Starting<span class="dot">.</span><span class="dot">.</span><span class="dot">.</span></div>
     <div class="bar-wrap"><div class="bar" id="bar"></div></div>
+    <div class="msg" id="msg">Starting<span class="dot">.</span><span class="dot">.</span><span class="dot">.</span></div>
+    <div class="timer" id="timer"></div>
   </div>
 
+  <div class="error" id="err"></div>
+
   <div id="result">
-    <div class="label">Your video is ready!</div>
+    <div class="ready-label">Video ready!</div>
     <video id="vid" controls autoplay playsinline></video>
-    <br>
-    <a id="dl" class="dl" download="astro-video.mp4">Download MP4</a>
-    <button class="new" onclick="reset()">Generate New</button>
+    <div class="actions">
+      <a id="dl" class="dl" download="astro-video.mp4">Download MP4</a>
+      <button class="newbtn" onclick="reset()">Generate New</button>
+    </div>
   </div>
 </div>
 
 <script>
-  // ← Paste your Cloudflare Worker URL here
-  const PROXY = "https://astro-video-proxy.YOUR-SUBDOMAIN.workers.dev";
+const PROXY = "https://astro-video-proxy.shreevathsa2k27.workers.dev";
 
-  function setBar(p){ document.getElementById('bar').style.width = p+'%'; }
-  function setMsg(m){ document.getElementById('msg').innerHTML = m+'<span class="dot">.</span><span class="dot">.</span><span class="dot">.</span>'; }
+let elapsed = 0;
+let timerInterval = null;
+let pollInterval  = null;
 
-  function reset(){
-    document.getElementById('result').style.display = 'none';
-    document.getElementById('status').style.display = 'none';
-    document.getElementById('btn').disabled = false;
-    setBar(0);
+function setBar(p){
+  document.getElementById('bar').style.width = p + '%';
+}
+function setMsg(m){
+  document.getElementById('msg').innerHTML = m + '<span class="dot">.</span><span class="dot">.</span><span class="dot">.</span>';
+}
+function showError(msg){
+  const e = document.getElementById('err');
+  e.textContent = msg;
+  e.style.display = 'block';
+  document.getElementById('btn').disabled = false;
+  document.getElementById('status').style.display = 'none';
+}
+
+function startTimer(){
+  elapsed = 0;
+  timerInterval = setInterval(() => {
+    elapsed++;
+    const m = Math.floor(elapsed / 60);
+    const s = elapsed % 60;
+    document.getElementById('timer').textContent =
+      `Elapsed: ${m > 0 ? m + 'm ' : ''}${s}s`;
+  }, 1000);
+}
+
+function reset(){
+  clearInterval(timerInterval);
+  clearInterval(pollInterval);
+  document.getElementById('result').style.display  = 'none';
+  document.getElementById('status').style.display  = 'none';
+  document.getElementById('err').style.display     = 'none';
+  document.getElementById('btn').disabled = false;
+  document.getElementById('vid').src = '';
+  setBar(0);
+}
+
+async function generate(){
+  document.getElementById('btn').disabled = true;
+  document.getElementById('result').style.display = 'none';
+  document.getElementById('err').style.display    = 'none';
+  document.getElementById('status').style.display = 'block';
+  setBar(5);
+  setMsg('Triggering workflow');
+  startTimer();
+
+  const startTime = new Date().toISOString();
+
+  let res;
+  try {
+    res = await fetch(`${PROXY}/trigger`, { method: 'POST' });
+  } catch(e) {
+    showError('Cannot reach proxy. Check your Cloudflare Worker URL.');
+    return;
   }
 
-  async function generate(){
-    document.getElementById('btn').disabled = true;
-    document.getElementById('result').style.display = 'none';
-    document.getElementById('status').style.display = 'block';
-    setBar(5); setMsg('Triggering workflow');
+  const data = await res.json();
 
-    const startTime = new Date().toISOString();
-
-    const res = await fetch(`${PROXY}/trigger`, { method: 'POST' });
-    const data = await res.json();
-
-    if(!data.ok){
-      setMsg('Error triggering workflow');
-      document.getElementById('btn').disabled = false;
-      return;
-    }
-
-    setTimeout(()=>{ setBar(15); setMsg('Downloading dataset from Kaggle'); }, 3000);
-    setTimeout(()=>{ setBar(40); setMsg('Randomly trimming clips'); },          25000);
-    setTimeout(()=>{ setBar(65); setMsg('Merging into 20s video'); },            60000);
-    setTimeout(()=>{ setBar(82); setMsg('Uploading to releases'); },             100000);
-    setTimeout(()=>{ setBar(90); setMsg('Almost done'); },                       130000);
-
-    pollRelease(startTime);
+  if(!data.ok){
+    showError(`Trigger failed (${data.status}): ${data.error || 'Check your GitHub token in the Worker secret.'}`);
+    clearInterval(timerInterval);
+    return;
   }
 
-  async function pollRelease(startTime){
+  // Progress animation
+  const steps = [
+    [8,   5000,  'Workflow queued'],
+    [20,  12000, 'Downloading dataset from Kaggle'],
+    [45,  35000, 'Randomly selecting and trimming clips'],
+    [68,  70000, 'Encoding clips to same format'],
+    [82,  110000,'Merging into 20s video'],
+    [90,  140000,'Uploading to GitHub Releases'],
+    [95,  160000,'Finalizing'],
+  ];
+
+  for(const [pct, delay, msg] of steps){
+    setTimeout(() => {
+      setBar(pct);
+      setMsg(msg);
+    }, delay);
+  }
+
+  // Poll every 8 seconds for the new release
+  let pollCount = 0;
+  pollInterval = setInterval(async () => {
+    pollCount++;
+    // Start checking after 45 seconds
+    if(pollCount < 6) return;
+
     try {
-      const r = await fetch(`${PROXY}/release?since=${encodeURIComponent(startTime)}`);
-      const data = await r.json();
-      if(data.videoUrl){
+      const r    = await fetch(`${PROXY}/release?since=${encodeURIComponent(startTime)}`);
+      const json = await r.json();
+
+      if(json.videoUrl){
+        clearInterval(pollInterval);
+        clearInterval(timerInterval);
         setBar(100);
-        document.getElementById('status').style.display = 'none';
-        document.getElementById('result').style.display  = 'block';
-        document.getElementById('vid').src = data.videoUrl;
-        document.getElementById('dl').href = data.videoUrl;
-        document.getElementById('btn').disabled = false;
-        return;
+        setMsg('Done');
+        setTimeout(() => showVideo(json.videoUrl), 500);
       }
     } catch(e){}
-    setTimeout(() => pollRelease(startTime), 8000);
-  }
+  }, 8000);
+}
+
+function showVideo(url){
+  document.getElementById('status').style.display = 'none';
+  document.getElementById('result').style.display = 'block';
+  document.getElementById('btn').disabled = false;
+
+  const vid = document.getElementById('vid');
+  vid.src   = url;
+  vid.load();
+  vid.play().catch(() => {});
+
+  document.getElementById('dl').href = url;
+}
 </script>
 </body>
 </html>
