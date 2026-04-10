@@ -8,7 +8,7 @@ os.chmod(os.path.expanduser("~/.kaggle/kaggle.json"), 0o600)
 DATASET      = "shreevathsbbhh/video-clips"
 TARGET_TOTAL = 20.0
 MIN_CLIP     = 3.0
-MAX_CLIP     = 6.0
+MAX_CLIP     = 7.0
 WIDTH        = 1280
 HEIGHT       = 720
 FPS          = 30
@@ -36,17 +36,16 @@ print(f"Found {len(all_files)} video files")
 def get_duration(path):
     try:
         r = subprocess.run(
-            ["ffprobe","-v","quiet","-print_format","json","-show_format","-show_streams", path],
+            ["ffprobe","-v","quiet","-print_format","json",
+             "-show_format","-show_streams", path],
             capture_output=True, text=True, timeout=15
         )
         data = json.loads(r.stdout)
-        # Try video stream first
         for s in data.get("streams", []):
             if s.get("codec_type") == "video":
                 d = s.get("duration")
                 if d and float(d) > 0:
                     return float(d)
-        # Fallback to format
         d = data.get("format", {}).get("duration")
         return float(d) if d else 0.0
     except:
@@ -59,25 +58,23 @@ def is_valid_video(path):
             capture_output=True, text=True, timeout=10
         )
         data = json.loads(r.stdout)
-        has_video = any(s.get("codec_type") == "video" for s in data.get("streams", []))
-        return has_video
+        return any(s.get("codec_type") == "video" for s in data.get("streams", []))
     except:
         return False
 
 random.shuffle(all_files)
 
-# Build list of (file, start, duration) segments until we reach 20s
-segments   = []
-total_dur  = 0.0
-pool       = all_files.copy()
-idx        = 0
-fails      = 0
+segments  = []
+total_dur = 0.0
+pool      = all_files.copy()
+idx       = 0
+fails     = 0
 
 while total_dur < TARGET_TOTAL:
     remaining = TARGET_TOTAL - total_dur
     if remaining < 1.0:
         break
-    if fails > 40:
+    if fails > 50:
         print("Too many failures, stopping")
         break
     if idx >= len(pool):
@@ -91,50 +88,75 @@ while total_dur < TARGET_TOTAL:
         continue
 
     dur = get_duration(f)
-    if dur < MIN_CLIP:
+
+    # Need at least MIN_CLIP/2 seconds in source because slowmo doubles it
+    if dur < (MIN_CLIP / 2.0) + 0.5:
         fails += 1
         continue
 
-    clip_len = round(random.uniform(MIN_CLIP, min(MAX_CLIP, dur - 0.3)), 2)
-    clip_len = min(clip_len, remaining)
-    if clip_len < 1.0:
-        break
+    # desired output duration after slowmo, capped to remaining
+    desired_len = round(random.uniform(MIN_CLIP, min(MAX_CLIP, remaining)), 2)
 
-    max_start = max(0.0, dur - clip_len - 0.3)
-    start     = round(random.uniform(0, max_start), 2)
+    # extract half the duration from source — setpts=2.0 will double it
+    source_extract = round(desired_len / 2.0, 2)
 
-    segments.append((f, start, clip_len))
-    total_dur += clip_len
-    print(f"  Segment {len(segments)}: {os.path.basename(f)} | start={start}s | len={clip_len}s | total={total_dur:.1f}s")
+    # Try to pick from center 80% of clip for cleaner cuts
+    center_start = dur * 0.10
+    center_end   = dur * 0.90
+    center_len   = center_end - center_start
+
+    if source_extract <= center_len:
+        max_start = center_end - source_extract
+        start = round(random.uniform(center_start, max_start), 2)
+    elif source_extract <= dur - 0.5:
+        # fallback: use full clip range
+        start = round(random.uniform(0.0, dur - source_extract - 0.3), 2)
+    else:
+        fails += 1
+        continue
+
+    segments.append((f, start, source_extract, desired_len))
+    total_dur += desired_len
     fails = 0
+    print(f"  Segment {len(segments)}: {os.path.basename(f)} | "
+          f"source_start={start:.2f}s | extract={source_extract:.2f}s | "
+          f"after_slowmo={desired_len:.2f}s | total={total_dur:.1f}s")
 
-print(f"\nTotal segments: {len(segments)} | Total: {total_dur:.2f}s")
+print(f"\nTotal segments: {len(segments)} | Total after slowmo: {total_dur:.2f}s")
 
 if not segments:
     print("No segments found!")
     exit(1)
 
-# Build FFmpeg command using filter_complex concat
-# This handles ALL format differences — no pre-processing needed
-# Each input gets trimmed and normalized inside one single FFmpeg call
-
-inputs = []
+inputs       = []
 filter_parts = []
 
-for i, (f, start, clip_len) in enumerate(segments):
-    inputs += ["-ss", str(start), "-t", str(clip_len), "-i", f]
+for i, (f, start, source_extract, desired_len) in enumerate(segments):
+    inputs += ["-ss", str(start), "-t", str(source_extract), "-i", f]
+
     filter_parts.append(
-        f"[{i}:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
+        # Video: scale → pad → fps → setsar → slow to 0.5x speed → reset pts
+        f"[{i}:v]"
+        f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
         f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
         f"fps={FPS},"
         f"setsar=1,"
-        f"setpts=PTS-STARTPTS[v{i}];"
-        f"[{i}:a]aresample=44100,asetpts=PTS-STARTPTS[a{i}];"
+        f"setpts=2.0*PTS,"
+        f"setpts=PTS-STARTPTS"
+        f"[v{i}];"
+
+        # Audio: resample → mute completely (no atempo needed since audio is muted)
+        f"[{i}:a]"
+        f"aresample=44100,"
+        f"volume=0,"
+        f"asetpts=PTS-STARTPTS"
+        f"[a{i}];"
     )
 
-n = len(segments)
+n        = len(segments)
 v_inputs = "".join(f"[v{i}]" for i in range(n))
 a_inputs = "".join(f"[a{i}]" for i in range(n))
+
 filter_complex = (
     "".join(filter_parts) +
     f"{v_inputs}concat=n={n}:v=1:a=0[vout];" +
@@ -162,12 +184,12 @@ cmd = (
     ]
 )
 
-print("\nRunning FFmpeg filter_complex concat...")
+print("\nRunning FFmpeg...")
 result = subprocess.run(cmd, capture_output=True, text=True)
 
 if result.returncode != 0:
     print("FFmpeg failed!")
-    print(result.stderr[-1000:])
+    print(result.stderr[-3000:])
     exit(1)
 
 final = get_duration("output.mp4")
