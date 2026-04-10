@@ -89,18 +89,16 @@ while total_dur < TARGET_TOTAL:
 
     dur = get_duration(f)
 
-    # Need at least MIN_CLIP/2 seconds in source because slowmo doubles it
+    # source_extract = half of desired output (slowmo 0.5x doubles duration)
+    # so we need at least MIN_CLIP/2 seconds available in the source
     if dur < (MIN_CLIP / 2.0) + 0.5:
         fails += 1
         continue
 
-    # desired output duration after slowmo, capped to remaining
-    desired_len = round(random.uniform(MIN_CLIP, min(MAX_CLIP, remaining)), 2)
-
-    # extract half the duration from source — setpts=2.0 will double it
+    desired_len    = round(random.uniform(MIN_CLIP, min(MAX_CLIP, remaining)), 2)
     source_extract = round(desired_len / 2.0, 2)
 
-    # Try to pick from center 80% of clip for cleaner cuts
+    # Pick from center 80% of clip
     center_start = dur * 0.10
     center_end   = dur * 0.90
     center_len   = center_end - center_start
@@ -109,7 +107,6 @@ while total_dur < TARGET_TOTAL:
         max_start = center_end - source_extract
         start = round(random.uniform(center_start, max_start), 2)
     elif source_extract <= dur - 0.5:
-        # fallback: use full clip range
         start = round(random.uniform(0.0, dur - source_extract - 0.3), 2)
     else:
         fails += 1
@@ -128,69 +125,106 @@ if not segments:
     print("No segments found!")
     exit(1)
 
-inputs       = []
-filter_parts = []
+# --- Step 1: Process each clip individually into a temp file ---
+# This avoids complex filter_complex sync issues with slowmo + concat
+temp_files = []
 
 for i, (f, start, source_extract, desired_len) in enumerate(segments):
-    inputs += ["-ss", str(start), "-t", str(source_extract), "-i", f]
+    tmp = f"temp_seg_{i}.mp4"
+    temp_files.append(tmp)
 
-    filter_parts.append(
-        # Video: scale → pad → fps → setsar → slow to 0.5x speed → reset pts
-        f"[{i}:v]"
-        f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
-        f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
-        f"fps={FPS},"
-        f"setsar=1,"
-        f"setpts=2.0*PTS,"
-        f"setpts=PTS-STARTPTS"
-        f"[v{i}];"
-
-        # Audio: resample → mute completely (no atempo needed since audio is muted)
-        f"[{i}:a]"
-        f"aresample=44100,"
-        f"volume=0,"
-        f"asetpts=PTS-STARTPTS"
-        f"[a{i}];"
-    )
-
-n        = len(segments)
-v_inputs = "".join(f"[v{i}]" for i in range(n))
-a_inputs = "".join(f"[a{i}]" for i in range(n))
-
-filter_complex = (
-    "".join(filter_parts) +
-    f"{v_inputs}concat=n={n}:v=1:a=0[vout];" +
-    f"{a_inputs}concat=n={n}:v=0:a=1[aout]"
-)
-
-cmd = (
-    ["ffmpeg", "-y"] +
-    inputs +
-    [
-        "-filter_complex", filter_complex,
-        "-map", "[vout]",
-        "-map", "[aout]",
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start),
+        "-t",  str(source_extract),
+        "-i",  f,
+        "-vf", (
+            f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"fps={FPS},"
+            f"setsar=1,"
+            f"setpts=2.0*PTS"       # slow video to 0.5x
+        ),
+        "-af", "aresample=44100,atempo=0.5",   # slow audio to match video
         "-c:v", "libx264",
         "-preset", "fast",
-        "-crf", "22",
+        "-crf",  "22",
         "-profile:v", "high",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "128k",
-        "-ar", "44100",
-        "-ac", "2",
-        "-movflags", "+faststart",
-        "output.mp4"
+        "-ar",  "44100",
+        "-ac",  "2",
+        tmp
     ]
-)
 
-print("\nRunning FFmpeg...")
-result = subprocess.run(cmd, capture_output=True, text=True)
+    print(f"Processing segment {i+1}/{len(segments)}...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Segment {i} failed: {result.stderr[-500:]}")
+        exit(1)
 
+# --- Step 2: Concat all temp files using concat demuxer ---
+list_file = "concat_list.txt"
+with open(list_file, "w") as lf:
+    for tmp in temp_files:
+        lf.write(f"file '{tmp}'\n")
+
+print("\nConcatenating all segments...")
+concat_cmd = [
+    "ffmpeg", "-y",
+    "-f", "concat",
+    "-safe", "0",
+    "-i", list_file,
+    "-c:v", "libx264",
+    "-preset", "fast",
+    "-crf", "22",
+    "-profile:v", "high",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-ar", "44100",
+    "-ac", "2",
+    "-movflags", "+faststart",
+    "output_with_audio.mp4"
+]
+
+result = subprocess.run(concat_cmd, capture_output=True, text=True)
 if result.returncode != 0:
-    print("FFmpeg failed!")
-    print(result.stderr[-3000:])
+    print("Concat failed!")
+    print(result.stderr[-2000:])
     exit(1)
+
+# --- Step 3: Mute audio by replacing with silent track ---
+# Replacing audio AFTER concat ensures video duration is correct
+print("\nMuting audio...")
+mute_cmd = [
+    "ffmpeg", "-y",
+    "-i", "output_with_audio.mp4",
+    "-f", "lavfi",
+    "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+    "-c:v", "copy",          # copy video stream — no re-encode
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-shortest",             # match duration to video stream
+    "-movflags", "+faststart",
+    "output.mp4"
+]
+
+result = subprocess.run(mute_cmd, capture_output=True, text=True)
+if result.returncode != 0:
+    print("Mute step failed!")
+    print(result.stderr[-2000:])
+    exit(1)
+
+# Cleanup temp files
+for tmp in temp_files:
+    try: os.remove(tmp)
+    except: pass
+try: os.remove("output_with_audio.mp4")
+except: pass
+try: os.remove(list_file)
+except: pass
 
 final = get_duration("output.mp4")
 size  = os.path.getsize("output.mp4") / (1024*1024)
