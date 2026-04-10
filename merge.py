@@ -54,7 +54,6 @@ def get_duration(path):
 
 
 def has_audio(path):
-    """Check if the video file has an audio stream."""
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
@@ -105,7 +104,6 @@ while total_dur < TARGET_TOTAL:
 
     dur = get_duration(f)
 
-    # Need at least MIN_CLIP/2 source seconds (slowmo doubles duration)
     if dur < (MIN_CLIP / 2.0) + 0.5:
         fails += 1
         continue
@@ -113,7 +111,6 @@ while total_dur < TARGET_TOTAL:
     desired_len    = round(random.uniform(MIN_CLIP, min(MAX_CLIP, remaining)), 2)
     source_extract = round(desired_len / 2.0, 2)
 
-    # Pick from center 80% of clip for cleaner cuts
     center_start = dur * 0.10
     center_end   = dur * 0.90
     center_len   = center_end - center_start
@@ -142,12 +139,11 @@ if not segments:
 
 
 # ---------------------------------------------------------------
-# Step 1: Process each clip into a normalised temp file
-#         - Scale to 1280x720, 30fps
-#         - Slow video to 0.5x with setpts=2.0*PTS
-#         - Slow audio with two chained atempo=0.7071
-#           (0.7071 x 0.7071 = 0.5  — avoids the atempo=0.5 bug)
-#         - If clip has no audio, generate silent audio for it
+# Step 1: Process each clip into a normalised silent temp file
+#   - Scale to 1280x720, 30fps
+#   - Slow video to 0.5x (setpts=2.0*PTS)
+#   - Replace audio with silence so every temp file has
+#     a proper silent audio track that matches video duration
 # ---------------------------------------------------------------
 temp_files = []
 
@@ -163,40 +159,31 @@ for i, (f, start, source_extract, desired_len) in enumerate(segments):
         f"setpts=2.0*PTS"
     )
 
-    clip_has_audio = has_audio(f)
-
-    if clip_has_audio:
-        # Chain two atempo=0.7071 to achieve 0.5x without FFmpeg rejecting 0.5
-        audio_filter = "aresample=44100,atempo=0.7071,atempo=0.7071"
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(start),
-            "-t",  str(source_extract),
-            "-i",  f,
-            "-vf", video_filter,
-            "-af", audio_filter,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-            "-profile:v", "high", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
-            tmp
-        ]
-    else:
-        # No audio stream — generate silent audio alongside slowed video
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(start),
-            "-t",  str(source_extract),
-            "-i",  f,
-            "-f", "lavfi",
-            "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-            "-vf", video_filter,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-            "-profile:v", "high", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
-            "-map", "0:v", "-map", "1:a",
-            "-t", str(desired_len),   # limit to slowed duration
-            tmp
-        ]
+    # Always generate fresh silence — avoids atempo bugs and audio/video
+    # length mismatch entirely. anullsrc gives infinite silence;
+    # -t desired_len trims it to exactly the right duration.
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start),
+        "-t",  str(source_extract),
+        "-i",  f,
+        "-f",  "lavfi",
+        "-i",  "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-map", "0:v",
+        "-map", "1:a",
+        "-vf", video_filter,
+        "-t",  str(desired_len),      # trim both streams to exact slowed duration
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "22",
+        "-profile:v", "high",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar",  "44100",
+        "-ac",  "2",
+        tmp
+    ]
 
     print(f"Processing segment {i+1}/{len(segments)}: {os.path.basename(f)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -204,14 +191,13 @@ for i, (f, start, source_extract, desired_len) in enumerate(segments):
         print(f"Segment {i+1} failed!\n{result.stderr[-800:]}")
         exit(1)
 
-    # Verify the temp file actually has correct duration
     actual = get_duration(tmp)
-    print(f"  → temp file duration: {actual:.2f}s (expected ~{desired_len:.2f}s)")
+    print(f"  → temp duration: {actual:.2f}s (expected ~{desired_len:.2f}s)")
 
 
 # ---------------------------------------------------------------
-# Step 2: Concatenate all temp files using concat demuxer
-#         All files are same codec/resolution so stream copy is safe
+# Step 2: Concat all temp files
+#   All files are identical format/codec so stream copy is safe
 # ---------------------------------------------------------------
 list_file = "concat_list.txt"
 with open(list_file, "w") as lf:
@@ -224,9 +210,9 @@ concat_cmd = [
     "-f", "concat",
     "-safe", "0",
     "-i", list_file,
-    "-c", "copy",             # stream copy — no quality loss, no sync issues
+    "-c", "copy",
     "-movflags", "+faststart",
-    "output_with_audio.mp4"
+    "output.mp4"
 ]
 
 result = subprocess.run(concat_cmd, capture_output=True, text=True)
@@ -235,44 +221,13 @@ if result.returncode != 0:
     print(result.stderr[-2000:])
     exit(1)
 
-concat_dur = get_duration("output_with_audio.mp4")
-print(f"Concat done — duration: {concat_dur:.2f}s")
-
-
-# ---------------------------------------------------------------
-# Step 3: Replace audio with silence
-#         Use exact video duration with -t to prevent any cut-short
-# ---------------------------------------------------------------
-print("\nMuting audio...")
-mute_cmd = [
-    "ffmpeg", "-y",
-    "-i", "output_with_audio.mp4",
-    "-f", "lavfi",
-    "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-    "-map", "0:v",            # video from real file
-    "-map", "1:a",            # silent audio from lavfi
-    "-c:v", "copy",           # no video re-encode — preserves full duration
-    "-c:a", "aac", "-b:a", "128k",
-    "-t", str(concat_dur),    # explicitly set duration = full video length
-    "-movflags", "+faststart",
-    "output.mp4"
-]
-
-result = subprocess.run(mute_cmd, capture_output=True, text=True)
-if result.returncode != 0:
-    print("Mute step failed!")
-    print(result.stderr[-2000:])
-    exit(1)
-
-# Cleanup
+# Cleanup temp files
 for tmp in temp_files:
     try: os.remove(tmp)
     except: pass
-try: os.remove("output_with_audio.mp4")
-except: pass
 try: os.remove(list_file)
 except: pass
 
 final = get_duration("output.mp4")
 size  = os.path.getsize("output.mp4") / (1024 * 1024)
-print(f"\n✅ Done! output.mp4 — {final:.2f}s — {size:.1f}MB")
+print(f"\nDone! output.mp4 — {final:.2f}s — {size:.1f}MB")
