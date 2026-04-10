@@ -8,7 +8,7 @@ os.chmod(os.path.expanduser("~/.kaggle/kaggle.json"), 0o600)
 DATASET      = "shreevathsbbhh/video-clips"
 TARGET_TOTAL = 20.0
 MIN_CLIP     = 3.0
-MAX_CLIP     = 6.0
+MAX_CLIP     = 7.0        # Fixed: was 6.0, requirement is 3–7s
 WIDTH        = 1280
 HEIGHT       = 720
 FPS          = 30
@@ -88,29 +88,34 @@ while total_dur < TARGET_TOTAL:
         continue
 
     dur = get_duration(f)
-    if dur < MIN_CLIP * 2:
-        # Need enough duration for slow motion
-        # slow motion doubles the clip duration so source needs 2x
+
+    # source_extract = half of desired output length (because 0.5x slowmo doubles it)
+    # We need source_extract to fit inside the clip, so min source dur = MIN_CLIP/2 = 1.5s
+    if dur < (MIN_CLIP / 2.0) + 0.5:
         fails += 1
         continue
 
-    # --- Random segment from CENTER region of the clip ---
-    # Avoid first 10% and last 10% — pick from middle 80%
+    # desired output duration (after slowmo), capped to remaining
+    desired_len = round(random.uniform(MIN_CLIP, min(MAX_CLIP, remaining)), 2)
+
+    # source extract length = half, since setpts=2.0 doubles duration
+    source_extract = round(desired_len / 2.0, 2)
+
+    # Avoid first and last 10% of clip for cleaner cuts
     center_start = dur * 0.10
     center_end   = dur * 0.90
     center_len   = center_end - center_start
 
-    # How long to extract from source (half of desired because slowmo 0.5x doubles it)
-    desired_len    = round(random.uniform(MIN_CLIP, min(MAX_CLIP, remaining)), 2)
-    source_extract = round(desired_len / 2.0, 2)  # extract half, slow to get full
-
+    # If source_extract doesn't fit in center region, try full clip range
     if source_extract > center_len:
-        fails += 1
-        continue
-
-    # Random start inside center region
-    max_start = center_end - source_extract
-    start     = round(random.uniform(center_start, max_start), 2)
+        # Fall back to full clip with small margin
+        if source_extract > dur - 0.5:
+            fails += 1
+            continue
+        start = round(random.uniform(0.0, dur - source_extract - 0.3), 2)
+    else:
+        max_start = center_end - source_extract
+        start = round(random.uniform(center_start, max_start), 2)
 
     segments.append((f, start, source_extract, desired_len))
     total_dur += desired_len
@@ -125,14 +130,6 @@ if not segments:
     print("No segments found!")
     exit(1)
 
-# Build one single FFmpeg command with filter_complex
-# Each clip:
-#   1. Trim the center segment
-#   2. Scale to 1280x720
-#   3. Slow down to 0.5x speed (setpts=2.0*PTS for video, atempo=0.5 for audio)
-#   4. Mute audio (volume=0)
-#   5. Concat all clips
-
 inputs       = []
 filter_parts = []
 
@@ -140,21 +137,20 @@ for i, (f, start, source_extract, desired_len) in enumerate(segments):
     inputs += ["-ss", str(start), "-t", str(source_extract), "-i", f]
 
     filter_parts.append(
-        # Video: scale → pad → fps → slow down to 0.5x → reset pts
+        # Video: scale → pad → fps → setsar → slow to 0.5x → reset pts
         f"[{i}:v]"
         f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
         f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
         f"fps={FPS},"
         f"setsar=1,"
-        f"setpts=2.0*PTS,"        # slow down video to 0.5x
+        f"setpts=2.0*PTS,"
         f"setpts=PTS-STARTPTS"
         f"[v{i}];"
 
-        # Audio: resample → slow down → mute completely
+        # Audio: resample → silence (volume=0, no atempo to avoid filter errors)
         f"[{i}:a]"
         f"aresample=44100,"
-        f"atempo=0.5,"             # slow down audio to 0.5x
-        f"volume=0,"              # mute background audio
+        f"volume=0,"
         f"asetpts=PTS-STARTPTS"
         f"[a{i}];"
     )
@@ -195,7 +191,7 @@ result = subprocess.run(cmd, capture_output=True, text=True)
 
 if result.returncode != 0:
     print("FFmpeg failed!")
-    print(result.stderr[-1500:])
+    print(result.stderr[-3000:])
     exit(1)
 
 final = get_duration("output.mp4")
