@@ -1,31 +1,35 @@
 name: Random Video Merger
+
 on:
   workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
 
 jobs:
   merge:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Install dependencies
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg and kaggle
         run: |
+          sudo apt-get update -y
           sudo apt-get install -y ffmpeg
           pip install kaggle --break-system-packages
 
-      - name: Download & merge
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run merge script
         run: python merge.py
 
-      - name: Upload to release
+      - name: Upload video to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="video-$(date +%Y%m%d-%H%M%S)"
           gh release create "$TAG" output.mp4 \
             --title "Random Merge $TAG" \
-            --notes "Auto-generated 20s random video"
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          ASSET_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/output.mp4"
-          echo "ASSET_URL=$ASSET_URL" >> $GITHUB_OUTPUT
+            --notes "Auto-generated 20s random video" \
+            --repo Vahjnjii/Astro-Video-Generator
