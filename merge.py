@@ -53,18 +53,6 @@ def get_duration(path):
         return 0.0
 
 
-def has_audio(path):
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
-            capture_output=True, text=True, timeout=10
-        )
-        data = json.loads(r.stdout)
-        return any(s.get("codec_type") == "audio" for s in data.get("streams", []))
-    except:
-        return False
-
-
 def is_valid_video(path):
     try:
         r = subprocess.run(
@@ -139,11 +127,12 @@ if not segments:
 
 
 # ---------------------------------------------------------------
-# Step 1: Process each clip into a normalised silent temp file
-#   - Scale to 1280x720, 30fps
-#   - Slow video to 0.5x (setpts=2.0*PTS)
-#   - Replace audio with silence so every temp file has
-#     a proper silent audio track that matches video duration
+# Step 1: For each clip, use filter_complex to:
+#   - Take video from input file
+#   - Generate silence from anullsrc
+#   - Scale, pad, fps, slow video (setpts=2.0*PTS)
+#   - Encode both video + silent audio into temp file
+#   Using filter_complex avoids ALL stream index ambiguity
 # ---------------------------------------------------------------
 temp_files = []
 
@@ -151,28 +140,29 @@ for i, (f, start, source_extract, desired_len) in enumerate(segments):
     tmp = f"temp_seg_{i}.mp4"
     temp_files.append(tmp)
 
-    video_filter = (
+    filter_complex = (
+        # Video chain: scale → pad → fps → setsar → slow to 0.5x
+        f"[0:v]"
         f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
         f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
         f"fps={FPS},"
         f"setsar=1,"
         f"setpts=2.0*PTS"
+        f"[vout];"
+        # Silent audio from anullsrc (input 1), trimmed to exact slowed duration
+        f"[1:a]atrim=0:{desired_len},asetpts=PTS-STARTPTS[aout]"
     )
 
-    # Always generate fresh silence — avoids atempo bugs and audio/video
-    # length mismatch entirely. anullsrc gives infinite silence;
-    # -t desired_len trims it to exactly the right duration.
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start),
         "-t",  str(source_extract),
-        "-i",  f,
+        "-i",  f,                                    # input 0: video file
         "-f",  "lavfi",
-        "-i",  "anullsrc=channel_layout=stereo:sample_rate=44100",
-        "-map", "0:v",
-        "-map", "1:a",
-        "-vf", video_filter,
-        "-t",  str(desired_len),      # trim both streams to exact slowed duration
+        "-i",  "anullsrc=channel_layout=stereo:sample_rate=44100",  # input 1: silence
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",                            # map processed video
+        "-map", "[aout]",                            # map silence
         "-c:v", "libx264",
         "-preset", "fast",
         "-crf", "22",
@@ -188,16 +178,29 @@ for i, (f, start, source_extract, desired_len) in enumerate(segments):
     print(f"Processing segment {i+1}/{len(segments)}: {os.path.basename(f)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"Segment {i+1} failed!\n{result.stderr[-800:]}")
+        print(f"Segment {i+1} failed!\n{result.stderr[-1000:]}")
         exit(1)
 
     actual = get_duration(tmp)
     print(f"  → temp duration: {actual:.2f}s (expected ~{desired_len:.2f}s)")
 
+    # Verify video stream exists in temp file
+    r = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", tmp],
+        capture_output=True, text=True
+    )
+    streams = json.loads(r.stdout).get("streams", [])
+    has_v = any(s.get("codec_type") == "video" for s in streams)
+    has_a = any(s.get("codec_type") == "audio" for s in streams)
+    print(f"  → streams: video={has_v} audio={has_a}")
+    if not has_v:
+        print(f"ERROR: No video stream in temp segment {i+1}!")
+        exit(1)
+
 
 # ---------------------------------------------------------------
-# Step 2: Concat all temp files
-#   All files are identical format/codec so stream copy is safe
+# Step 2: Concat all temp files using concat demuxer
+#   All files are same codec/res/fps — stream copy is safe
 # ---------------------------------------------------------------
 list_file = "concat_list.txt"
 with open(list_file, "w") as lf:
@@ -221,7 +224,7 @@ if result.returncode != 0:
     print(result.stderr[-2000:])
     exit(1)
 
-# Cleanup temp files
+# Cleanup
 for tmp in temp_files:
     try: os.remove(tmp)
     except: pass
