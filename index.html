@@ -10,19 +10,19 @@
   .card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:16px;padding:36px;width:100%;max-width:500px}
   h2{font-size:22px;margin-bottom:6px;text-align:center}
   .sub{color:#666;font-size:13px;text-align:center;margin-bottom:28px}
-  .btn{display:block;width:100%;padding:14px;background:#0066ff;color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;transition:background .2s;text-align:center}
+  .btn{display:block;width:100%;padding:14px;background:#0066ff;color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer;transition:background .2s}
   .btn:hover:not(:disabled){background:#0052cc}
   .btn:disabled{opacity:.4;cursor:not-allowed}
   #status{display:none;margin-top:20px}
   .bar-wrap{background:#222;border-radius:6px;height:8px;margin:10px 0 6px}
-  .bar{background:linear-gradient(90deg,#0066ff,#00aaff);height:8px;border-radius:6px;width:0%;transition:width .8s ease}
+  .bar{background:#0066ff;height:8px;border-radius:6px;width:0%;transition:width .8s ease}
   .msg{font-size:13px;color:#888;text-align:center;margin-top:6px}
   .timer{font-size:12px;color:#555;text-align:center;margin-top:4px}
   #result{display:none;margin-top:24px}
   .ready-label{font-size:14px;color:#4caf50;text-align:center;margin-bottom:12px;font-weight:600}
-  video{width:100%;border-radius:12px;background:#000;max-height:280px}
+  video{width:100%;border-radius:12px;background:#000}
   .actions{display:flex;gap:10px;margin-top:12px}
-  .dl{flex:1;padding:11px;background:#1a7f37;color:#fff;border-radius:8px;text-decoration:none;font-size:14px;font-weight:600;text-align:center;display:block}
+  .dl{flex:1;padding:11px;background:#1a7f37;color:#fff;border-radius:8px;text-decoration:none;font-size:14px;font-weight:600;text-align:center}
   .dl:hover{background:#156d2e}
   .newbtn{flex:1;padding:11px;background:#333;color:#fff;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;border:none}
   .newbtn:hover{background:#444}
@@ -30,7 +30,7 @@
   .dot:nth-child(2){animation-delay:.2s}
   .dot:nth-child(3){animation-delay:.4s}
   @keyframes blink{0%,80%,100%{opacity:0}40%{opacity:1}}
-  .error{color:#ff4444;font-size:13px;text-align:center;margin-top:12px;display:none}
+  .errmsg{color:#ff4444;font-size:13px;text-align:center;margin-top:12px;display:none}
 </style>
 </head>
 <body>
@@ -46,7 +46,7 @@
     <div class="timer" id="timer"></div>
   </div>
 
-  <div class="error" id="err"></div>
+  <div class="errmsg" id="errmsg"></div>
 
   <div id="result">
     <div class="ready-label">Video ready!</div>
@@ -61,32 +61,33 @@
 <script>
 const PROXY = "https://astro-video-proxy.shreevathsa2k27.workers.dev";
 
-let elapsed = 0;
 let timerInterval = null;
 let pollInterval  = null;
+let elapsed       = 0;
+let triggerTime   = null;
 
-function setBar(p){
-  document.getElementById('bar').style.width = p + '%';
-}
-function setMsg(m){
-  document.getElementById('msg').innerHTML = m + '<span class="dot">.</span><span class="dot">.</span><span class="dot">.</span>';
-}
+function setBar(p){ document.getElementById('bar').style.width = p+'%'; }
+function setMsg(m){ document.getElementById('msg').innerHTML = m+'<span class="dot">.</span><span class="dot">.</span><span class="dot">.</span>'; }
+
 function showError(msg){
-  const e = document.getElementById('err');
+  const e = document.getElementById('errmsg');
   e.textContent = msg;
   e.style.display = 'block';
   document.getElementById('btn').disabled = false;
   document.getElementById('status').style.display = 'none';
+  clearInterval(timerInterval);
+  clearInterval(pollInterval);
 }
 
 function startTimer(){
   elapsed = 0;
+  clearInterval(timerInterval);
   timerInterval = setInterval(() => {
     elapsed++;
-    const m = Math.floor(elapsed / 60);
+    const m = Math.floor(elapsed/60);
     const s = elapsed % 60;
     document.getElementById('timer').textContent =
-      `Elapsed: ${m > 0 ? m + 'm ' : ''}${s}s`;
+      `Elapsed: ${m > 0 ? m+'m ' : ''}${s}s`;
   }, 1000);
 }
 
@@ -95,7 +96,7 @@ function reset(){
   clearInterval(pollInterval);
   document.getElementById('result').style.display  = 'none';
   document.getElementById('status').style.display  = 'none';
-  document.getElementById('err').style.display     = 'none';
+  document.getElementById('errmsg').style.display  = 'none';
   document.getElementById('btn').disabled = false;
   document.getElementById('vid').src = '';
   setBar(0);
@@ -103,81 +104,79 @@ function reset(){
 
 async function generate(){
   document.getElementById('btn').disabled = true;
-  document.getElementById('result').style.display = 'none';
-  document.getElementById('err').style.display    = 'none';
-  document.getElementById('status').style.display = 'block';
+  document.getElementById('result').style.display  = 'none';
+  document.getElementById('errmsg').style.display  = 'none';
+  document.getElementById('status').style.display  = 'block';
   setBar(5);
   setMsg('Triggering workflow');
   startTimer();
 
-  const startTime = new Date().toISOString();
+  // Record time just BEFORE trigger so we catch the new release
+  triggerTime = new Date(Date.now() - 5000).toISOString();
 
   let res;
   try {
     res = await fetch(`${PROXY}/trigger`, { method: 'POST' });
   } catch(e) {
-    showError('Cannot reach proxy. Check your Cloudflare Worker URL.');
+    showError('Cannot reach Cloudflare Worker. Check your Worker is deployed.');
     return;
   }
 
-  const data = await res.json();
+  let data;
+  try { data = await res.json(); } catch(e) { data = {}; }
 
   if(!data.ok){
-    showError(`Trigger failed (${data.status}): ${data.error || 'Check your GitHub token in the Worker secret.'}`);
-    clearInterval(timerInterval);
+    showError(`Trigger failed (${data.status}): ${data.error || 'Check GITHUB_TOKEN secret in Cloudflare Worker.'}`);
     return;
   }
 
-  // Progress animation
+  // Progress steps
   const steps = [
-    [8,   5000,  'Workflow queued'],
-    [20,  12000, 'Downloading dataset from Kaggle'],
-    [45,  35000, 'Randomly selecting and trimming clips'],
-    [68,  70000, 'Encoding clips to same format'],
-    [82,  110000,'Merging into 20s video'],
-    [90,  140000,'Uploading to GitHub Releases'],
-    [95,  160000,'Finalizing'],
+    [10,  4000,  'Workflow queued on GitHub'],
+    [25,  15000, 'Downloading dataset from Kaggle'],
+    [45,  40000, 'Selecting and trimming random clips'],
+    [65,  80000, 'Encoding clips'],
+    [80,  120000,'Merging into 20s video'],
+    [90,  150000,'Uploading to GitHub Releases'],
+    [95,  170000,'Almost ready'],
   ];
-
   for(const [pct, delay, msg] of steps){
-    setTimeout(() => {
-      setBar(pct);
-      setMsg(msg);
-    }, delay);
+    setTimeout(() => { setBar(pct); setMsg(msg); }, delay);
   }
 
-  // Poll every 8 seconds for the new release
-  let pollCount = 0;
-  pollInterval = setInterval(async () => {
-    pollCount++;
-    // Start checking after 45 seconds
-    if(pollCount < 6) return;
+  // Start polling immediately — every 10 seconds
+  // Uses triggerTime so we only pick up THIS run's release
+  clearInterval(pollInterval);
+  pollInterval = setInterval(() => pollRelease(), 10000);
+}
 
-    try {
-      const r    = await fetch(`${PROXY}/release?since=${encodeURIComponent(startTime)}`);
-      const json = await r.json();
+async function pollRelease(){
+  try {
+    const url = `${PROXY}/release?since=${encodeURIComponent(triggerTime)}`;
+    const r    = await fetch(url);
+    const json = await r.json();
 
-      if(json.videoUrl){
-        clearInterval(pollInterval);
-        clearInterval(timerInterval);
-        setBar(100);
-        setMsg('Done');
-        setTimeout(() => showVideo(json.videoUrl), 500);
-      }
-    } catch(e){}
-  }, 8000);
+    console.log('Poll response:', json);
+
+    if(json.videoUrl){
+      clearInterval(pollInterval);
+      clearInterval(timerInterval);
+      setBar(100);
+      setTimeout(() => showVideo(json.videoUrl), 400);
+    }
+  } catch(e){
+    console.log('Poll error:', e);
+  }
 }
 
 function showVideo(url){
   document.getElementById('status').style.display = 'none';
   document.getElementById('result').style.display = 'block';
   document.getElementById('btn').disabled = false;
-
   const vid = document.getElementById('vid');
   vid.src   = url;
   vid.load();
-  vid.play().catch(() => {});
-
+  vid.play().catch(()=>{});
   document.getElementById('dl').href = url;
 }
 </script>
