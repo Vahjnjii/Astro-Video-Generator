@@ -9,6 +9,9 @@ DATASET      = "shreevathsbbhh/video-clips"
 TARGET_TOTAL = 20.0
 MIN_CLIP     = 3.0
 MAX_CLIP     = 6.0
+WIDTH        = 1280
+HEIGHT       = 720
+FPS          = 30
 
 os.makedirs("videos", exist_ok=True)
 print("Downloading dataset...")
@@ -33,144 +36,140 @@ print(f"Found {len(all_files)} video files")
 def get_duration(path):
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
+            ["ffprobe","-v","quiet","-print_format","json","-show_format","-show_streams", path],
             capture_output=True, text=True, timeout=15
         )
         data = json.loads(r.stdout)
+        # Try video stream first
         for s in data.get("streams", []):
             if s.get("codec_type") == "video":
-                d = s.get("duration", 0)
+                d = s.get("duration")
                 if d and float(d) > 0:
                     return float(d)
-        # fallback: try format duration
-        r2 = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path],
-            capture_output=True, text=True, timeout=15
-        )
-        data2 = json.loads(r2.stdout)
-        d = data2.get("format", {}).get("duration", 0)
+        # Fallback to format
+        d = data.get("format", {}).get("duration")
         return float(d) if d else 0.0
     except:
         return 0.0
 
+def is_valid_video(path):
+    try:
+        r = subprocess.run(
+            ["ffprobe","-v","quiet","-print_format","json","-show_streams", path],
+            capture_output=True, text=True, timeout=10
+        )
+        data = json.loads(r.stdout)
+        has_video = any(s.get("codec_type") == "video" for s in data.get("streams", []))
+        return has_video
+    except:
+        return False
+
 random.shuffle(all_files)
-os.makedirs("clips", exist_ok=True)
 
-segments     = []
-total_so_far = 0.0
-file_pool    = all_files.copy()
-idx          = 0
-fail_count   = 0
+# Build list of (file, start, duration) segments until we reach 20s
+segments   = []
+total_dur  = 0.0
+pool       = all_files.copy()
+idx        = 0
+fails      = 0
 
-while total_so_far < TARGET_TOTAL:
-    remaining = TARGET_TOTAL - total_so_far
-
+while total_dur < TARGET_TOTAL:
+    remaining = TARGET_TOTAL - total_dur
     if remaining < 1.0:
         break
-
-    if idx >= len(file_pool):
-        random.shuffle(file_pool)
+    if fails > 40:
+        print("Too many failures, stopping")
+        break
+    if idx >= len(pool):
+        random.shuffle(pool)
         idx = 0
 
-    if fail_count > 30:
-        print("Too many failures, stopping early")
-        break
+    f = pool[idx]; idx += 1
 
-    f = file_pool[idx]; idx += 1
-    dur = get_duration(f)
-    print(f"  Checking: {os.path.basename(f)} duration={dur:.1f}s")
-
-    if dur < MIN_CLIP:
+    if not is_valid_video(f):
+        fails += 1
         continue
 
-    # Clip length — random between MIN and MAX, but never exceed remaining
-    clip_len = round(random.uniform(MIN_CLIP, min(MAX_CLIP, dur - 0.5)), 2)
+    dur = get_duration(f)
+    if dur < MIN_CLIP:
+        fails += 1
+        continue
+
+    clip_len = round(random.uniform(MIN_CLIP, min(MAX_CLIP, dur - 0.3)), 2)
     clip_len = min(clip_len, remaining)
     if clip_len < 1.0:
         break
 
-    # Random start — ensure enough room
-    max_start = max(0.0, dur - clip_len - 0.5)
-    start = round(random.uniform(0, max_start), 2)
+    max_start = max(0.0, dur - clip_len - 0.3)
+    start     = round(random.uniform(0, max_start), 2)
 
-    out_clip = f"clips/clip_{len(segments):04d}.mp4"
+    segments.append((f, start, clip_len))
+    total_dur += clip_len
+    print(f"  Segment {len(segments)}: {os.path.basename(f)} | start={start}s | len={clip_len}s | total={total_dur:.1f}s")
+    fails = 0
 
-    # Re-encode every clip to IDENTICAL format — this is the key fix
-    # Same resolution, same codec, same fps, same audio — guarantees clean concat
-    ret = subprocess.run([
-        "ffmpeg", "-y",
-        "-ss", str(start),
-        "-i", f,
-        "-t", str(clip_len),
-        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,fps=30",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "23",
-        "-profile:v", "baseline",
-        "-level", "3.0",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-ar", "44100",
-        "-ac", "2",
-        "-b:a", "128k",
-        "-avoid_negative_ts", "make_zero",
-        "-fflags", "+genpts",
-        "-movflags", "+faststart",
-        out_clip
-    ], capture_output=True, text=True)
-
-    if ret.returncode != 0:
-        print(f"  Skipping {os.path.basename(f)} — encode failed")
-        print(f"  Error: {ret.stderr[-300:]}")
-        fail_count += 1
-        continue
-
-    # Verify clip duration
-    actual_dur = get_duration(out_clip)
-    if actual_dur < 0.5:
-        print(f"  Skipping — output clip too short ({actual_dur}s)")
-        fail_count += 1
-        continue
-
-    segments.append(out_clip)
-    total_so_far += actual_dur
-    fail_count = 0
-    print(f"  Clip {len(segments)}: {os.path.basename(f)} | start={start}s | len={actual_dur:.2f}s | total={total_so_far:.1f}s")
-
-print(f"\nTotal clips: {len(segments)} | Total duration: {total_so_far:.2f}s")
+print(f"\nTotal segments: {len(segments)} | Total: {total_dur:.2f}s")
 
 if not segments:
-    print("No clips generated!")
+    print("No segments found!")
     exit(1)
 
-# Write concat list
-with open("concat.txt", "w") as f:
-    for clip in segments:
-        f.write(f"file '{os.path.abspath(clip)}'\n")
+# Build FFmpeg command using filter_complex concat
+# This handles ALL format differences — no pre-processing needed
+# Each input gets trimmed and normalized inside one single FFmpeg call
 
-print("Concatenating all clips...")
+inputs = []
+filter_parts = []
 
-# Use re-encode concat — 100% reliable, no corruption
-result = subprocess.run([
-    "ffmpeg", "-y",
-    "-f", "concat",
-    "-safe", "0",
-    "-i", "concat.txt",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "23",
-    "-pix_fmt", "yuv420p",
-    "-c:a", "aac",
-    "-ar", "44100",
-    "-ac", "2",
-    "-movflags", "+faststart",
-    "output.mp4"
-], capture_output=True, text=True)
+for i, (f, start, clip_len) in enumerate(segments):
+    inputs += ["-ss", str(start), "-t", str(clip_len), "-i", f]
+    filter_parts.append(
+        f"[{i}:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
+        f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"fps={FPS},"
+        f"setsar=1,"
+        f"setpts=PTS-STARTPTS[v{i}];"
+        f"[{i}:a]aresample=44100,asetpts=PTS-STARTPTS[a{i}];"
+    )
+
+n = len(segments)
+v_inputs = "".join(f"[v{i}]" for i in range(n))
+a_inputs = "".join(f"[a{i}]" for i in range(n))
+filter_complex = (
+    "".join(filter_parts) +
+    f"{v_inputs}concat=n={n}:v=1:a=0[vout];" +
+    f"{a_inputs}concat=n={n}:v=0:a=1[aout]"
+)
+
+cmd = (
+    ["ffmpeg", "-y"] +
+    inputs +
+    [
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "22",
+        "-profile:v", "high",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "44100",
+        "-ac", "2",
+        "-movflags", "+faststart",
+        "output.mp4"
+    ]
+)
+
+print("\nRunning FFmpeg filter_complex concat...")
+result = subprocess.run(cmd, capture_output=True, text=True)
 
 if result.returncode != 0:
-    print("Concat failed:")
-    print(result.stderr[-500:])
+    print("FFmpeg failed!")
+    print(result.stderr[-1000:])
     exit(1)
 
-final_dur = get_duration("output.mp4")
-print(f"\nDone! output.mp4 — duration: {final_dur:.2f}s")
+final = get_duration("output.mp4")
+size  = os.path.getsize("output.mp4") / (1024*1024)
+print(f"\nDone! output.mp4 — {final:.2f}s — {size:.1f}MB")
