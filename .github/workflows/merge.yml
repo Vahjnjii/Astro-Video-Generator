@@ -1,35 +1,203 @@
-name: Random Video Merger
+import os, random, subprocess, glob, json
 
-on:
-  workflow_dispatch:
+os.makedirs(os.path.expanduser("~/.kaggle"), exist_ok=True)
+with open(os.path.expanduser("~/.kaggle/kaggle.json"), "w") as f:
+    json.dump({"username": "shreevathsbbhh", "key": "83a92caa96ed51b5d5a9a730100c57aa"}, f)
+os.chmod(os.path.expanduser("~/.kaggle/kaggle.json"), 0o600)
 
-permissions:
-  contents: write
-  actions: write
+DATASET      = "shreevathsbbhh/video-clips"
+TARGET_TOTAL = 20.0
+MIN_CLIP     = 3.0
+MAX_CLIP     = 6.0
+WIDTH        = 1280
+HEIGHT       = 720
+FPS          = 30
 
-jobs:
-  merge:
-    runs-on: ubuntu-latest
+os.makedirs("videos", exist_ok=True)
+print("Downloading dataset...")
+subprocess.run(
+    ["kaggle", "datasets", "download", "-d", DATASET, "-p", "videos", "--unzip"],
+    check=True
+)
 
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+exts = ("*.mp4","*.MP4","*.mkv","*.avi","*.mov","*.webm","*.flv","*.wmv")
+all_files = []
+for ext in exts:
+    all_files.extend(glob.glob(f"videos/**/{ext}", recursive=True))
+    all_files.extend(glob.glob(f"videos/{ext}"))
+all_files = list(set(all_files))
 
-      - name: Install ffmpeg and kaggle
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y ffmpeg
-          pip install kaggle --break-system-packages
+if not all_files:
+    print("No video files found!")
+    exit(1)
 
-      - name: Run merge script
-        run: python merge.py
+print(f"Found {len(all_files)} video files")
 
-      - name: Upload video to GitHub Releases
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="video-$(date +%Y%m%d-%H%M%S)"
-          gh release create "$TAG" output.mp4 \
-            --title "Random Merge $TAG" \
-            --notes "Auto-generated 20s random video" \
-            --repo Vahjnjii/Astro-Video-Generator
+def get_duration(path):
+    try:
+        r = subprocess.run(
+            ["ffprobe","-v","quiet","-print_format","json",
+             "-show_format","-show_streams", path],
+            capture_output=True, text=True, timeout=15
+        )
+        data = json.loads(r.stdout)
+        for s in data.get("streams", []):
+            if s.get("codec_type") == "video":
+                d = s.get("duration")
+                if d and float(d) > 0:
+                    return float(d)
+        d = data.get("format", {}).get("duration")
+        return float(d) if d else 0.0
+    except:
+        return 0.0
+
+def is_valid_video(path):
+    try:
+        r = subprocess.run(
+            ["ffprobe","-v","quiet","-print_format","json","-show_streams", path],
+            capture_output=True, text=True, timeout=10
+        )
+        data = json.loads(r.stdout)
+        return any(s.get("codec_type") == "video" for s in data.get("streams", []))
+    except:
+        return False
+
+random.shuffle(all_files)
+
+segments  = []
+total_dur = 0.0
+pool      = all_files.copy()
+idx       = 0
+fails     = 0
+
+while total_dur < TARGET_TOTAL:
+    remaining = TARGET_TOTAL - total_dur
+    if remaining < 1.0:
+        break
+    if fails > 50:
+        print("Too many failures, stopping")
+        break
+    if idx >= len(pool):
+        random.shuffle(pool)
+        idx = 0
+
+    f = pool[idx]; idx += 1
+
+    if not is_valid_video(f):
+        fails += 1
+        continue
+
+    dur = get_duration(f)
+    if dur < MIN_CLIP * 2:
+        # Need enough duration for slow motion
+        # slow motion doubles the clip duration so source needs 2x
+        fails += 1
+        continue
+
+    # --- Random segment from CENTER region of the clip ---
+    # Avoid first 10% and last 10% — pick from middle 80%
+    center_start = dur * 0.10
+    center_end   = dur * 0.90
+    center_len   = center_end - center_start
+
+    # How long to extract from source (half of desired because slowmo 0.5x doubles it)
+    desired_len    = round(random.uniform(MIN_CLIP, min(MAX_CLIP, remaining)), 2)
+    source_extract = round(desired_len / 2.0, 2)  # extract half, slow to get full
+
+    if source_extract > center_len:
+        fails += 1
+        continue
+
+    # Random start inside center region
+    max_start = center_end - source_extract
+    start     = round(random.uniform(center_start, max_start), 2)
+
+    segments.append((f, start, source_extract, desired_len))
+    total_dur += desired_len
+    fails = 0
+    print(f"  Segment {len(segments)}: {os.path.basename(f)} | "
+          f"source_start={start:.2f}s | extract={source_extract:.2f}s | "
+          f"after_slowmo={desired_len:.2f}s | total={total_dur:.1f}s")
+
+print(f"\nTotal segments: {len(segments)} | Total after slowmo: {total_dur:.2f}s")
+
+if not segments:
+    print("No segments found!")
+    exit(1)
+
+# Build one single FFmpeg command with filter_complex
+# Each clip:
+#   1. Trim the center segment
+#   2. Scale to 1280x720
+#   3. Slow down to 0.5x speed (setpts=2.0*PTS for video, atempo=0.5 for audio)
+#   4. Mute audio (volume=0)
+#   5. Concat all clips
+
+inputs       = []
+filter_parts = []
+
+for i, (f, start, source_extract, desired_len) in enumerate(segments):
+    inputs += ["-ss", str(start), "-t", str(source_extract), "-i", f]
+
+    filter_parts.append(
+        # Video: scale → pad → fps → slow down to 0.5x → reset pts
+        f"[{i}:v]"
+        f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
+        f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"fps={FPS},"
+        f"setsar=1,"
+        f"setpts=2.0*PTS,"        # slow down video to 0.5x
+        f"setpts=PTS-STARTPTS"
+        f"[v{i}];"
+
+        # Audio: resample → slow down → mute completely
+        f"[{i}:a]"
+        f"aresample=44100,"
+        f"atempo=0.5,"             # slow down audio to 0.5x
+        f"volume=0,"              # mute background audio
+        f"asetpts=PTS-STARTPTS"
+        f"[a{i}];"
+    )
+
+n        = len(segments)
+v_inputs = "".join(f"[v{i}]" for i in range(n))
+a_inputs = "".join(f"[a{i}]" for i in range(n))
+
+filter_complex = (
+    "".join(filter_parts) +
+    f"{v_inputs}concat=n={n}:v=1:a=0[vout];" +
+    f"{a_inputs}concat=n={n}:v=0:a=1[aout]"
+)
+
+cmd = (
+    ["ffmpeg", "-y"] +
+    inputs +
+    [
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "22",
+        "-profile:v", "high",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "44100",
+        "-ac", "2",
+        "-movflags", "+faststart",
+        "output.mp4"
+    ]
+)
+
+print("\nRunning FFmpeg...")
+result = subprocess.run(cmd, capture_output=True, text=True)
+
+if result.returncode != 0:
+    print("FFmpeg failed!")
+    print(result.stderr[-1500:])
+    exit(1)
+
+final = get_duration("output.mp4")
+size  = os.path.getsize("output.mp4") / (1024*1024)
+print(f"\nDone! output.mp4 — {final:.2f}s — {size:.1f}MB")
