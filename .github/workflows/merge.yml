@@ -1,0 +1,31 @@
+name: Random Video Merger
+on:
+  workflow_dispatch:
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y ffmpeg
+          pip install kaggle --break-system-packages
+
+      - name: Download & merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python merge.py
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="video-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" output.mp4 \
+            --title "Random Merge $TAG" \
+            --notes "Auto-generated 20s random video"
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          ASSET_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/output.mp4"
+          echo "ASSET_URL=$ASSET_URL" >> $GITHUB_OUTPUT
